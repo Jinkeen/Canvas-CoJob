@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {JSDOM,VirtualConsole} from 'jsdom';
+import { once } from 'node:events';
+import { createAppServer } from '../server.mjs';
 import * as core from '../public/core.mjs';
 const html=await readFile(new URL('../public/index.html',import.meta.url),'utf8');
 const css=await readFile(new URL('../public/styles.css',import.meta.url),'utf8');
@@ -119,4 +121,125 @@ test('another tab updating while editing blocks stale overwrites and keeps a bac
 test('corrupted saved data is not silently overwritten on boot',async t=>{
   const broken='this was not JSON';const {w,$}=await setup(t,{saved:broken});
   assert.equal(w.localStorage.getItem(core.STORAGE_KEY),broken);assert.equal($('storageWarning').hidden,false);
+});
+
+test('handoff switches evidence modes in the app and exported HTML', async t => {
+  const { w, $ } = await setup(t);
+  $('handoffTab').click();
+  const dialog = $('handoffDialog');
+  const exported = new JSDOM(core.handoffHtml(core.initialWorkspace().projects[0]), { runScripts: 'outside-only' });
+  t.after(() => exported.window.close());
+  const script = exported.window.document.querySelector('script[data-handoff-controls]');
+  exported.window.eval(script.textContent);
+
+  for (const root of [dialog, exported.window.document.querySelector('main')]) {
+    const view = root.ownerDocument.defaultView;
+    const details = [...root.querySelectorAll('details[data-handoff-evidence]')];
+    const quick = root.querySelector('[data-evidence="quick"]');
+    const full = root.querySelector('[data-evidence="full"]');
+    assert.equal(details.length, 6);
+    assert.ok(details.every(detail => !detail.open));
+    full.click();
+    assert.ok(details.every(detail => detail.open));
+    assert.equal(full.getAttribute('aria-pressed'), 'true');
+    quick.click();
+    details[0].open = true;
+    view.dispatchEvent(new view.Event('beforeprint'));
+    assert.ok(details.every(detail => detail.open));
+    view.dispatchEvent(new view.Event('afterprint'));
+    assert.deepEqual(details.map(detail => detail.open), [true, false, false, false, false, false]);
+  }
+
+  dialog.close();
+  $('handoffTab').click();
+  assert.ok([...dialog.querySelectorAll('details')].every(detail => !detail.open));
+});
+
+test('web selection and purpose become a keyword node and a directed handoff', async t => {
+  const server = createAppServer();
+  server.listen(0,'127.0.0.1');
+  await once(server,'listening');
+  t.after(() => {server.closeAllConnections();server.close();});
+  const appUrl = 'http://127.0.0.1:' + server.address().port;
+  const quote = '模板版本更新时应清理关联缓存。';
+  const intent = '用于验证缓存失效条件';
+  const source = new JSDOM('<title>缓存验证</title><p>'+quote+'</p>', {
+    url:'https://example.test/cache',runScripts:'outside-only'
+  });
+  t.after(()=>source.window.close());
+  const {window:page} = source;
+  let shadow, receipt;
+  const attach = page.Element.prototype.attachShadow;
+  page.Element.prototype.attachShadow = function(options){return shadow=attach.call(this,options);};
+  page.Range.prototype.getBoundingClientRect = () => ({right:200,bottom:150});
+  let listener;
+  const chrome = {
+    runtime:{id:'a'.repeat(32),onMessage:{addListener:handler=>{listener=handler;}}},
+    tabs:{create:async ({url})=>{receipt=new URL(url).hash.slice(9);}}
+  };
+  const workerFetch = (url, options) => fetch(new URL(url).pathname.replace(/^/,appUrl), {
+    ...options,headers:{...options.headers,Origin:'chrome-extension://'+chrome.runtime.id}
+  });
+  const worker = await readFile(new URL('../../extension/worker.js',import.meta.url),'utf8');
+  new Function('chrome','fetch',worker)(chrome,workerFetch);
+  page.chrome = {runtime:{sendMessage:message=>new Promise(resolve=>{
+    assert.equal(message.data.quote,quote);
+    assert.equal(message.data.intent,intent);
+    assert.equal(listener(message,{id:chrome.runtime.id,tab:{id:1},url:page.location.href},resolve),true);
+  })}};
+  page.eval(await readFile(new URL('../../extension/capture.js',import.meta.url),'utf8'));
+  const range=page.document.createRange();
+  range.selectNodeContents(page.document.querySelector('p'));
+  page.getSelection().addRange(range);
+  page.document.querySelector('p').dispatchEvent(new page.Event('pointerup',{bubbles:true}));
+  await new Promise(resolve=>page.setTimeout(resolve,180));
+  assert.equal(shadow.querySelector('aside').hidden,false);
+  shadow.querySelector('textarea').value=intent;
+  await shadow.querySelector('form').onsubmit(new page.Event('submit'));
+  assert.ok(receipt);
+  assert.equal(shadow.querySelector('aside').hidden,true);
+
+  const workspace=core.initialWorkspace();
+  const project=workspace.projects[0];
+  const scheme=core.makeCard({quote:'相同请求可以复用生成结果。',intent:'用于采用缓存方案'});
+  const unrelated=core.makeCard({quote:'会议室预约请找行政。',intent:'用于预约会议室'});
+  project.cards=[scheme,unrelated];project.edges=[];
+  core.arrange(project);
+  let imported;
+  const loaded=new Promise(resolve=>{imported=resolve;});
+  const {w,$,state}=await setup(t,{url:appUrl+'/#receipt='+receipt,saved:JSON.stringify(workspace),
+    fetcher:async path=>{
+      const response=await fetch(appUrl+path);
+      return {ok:response.ok,json:async()=>{const data=await response.json();setImmediate(imported);return data;}};
+    }});
+  await loaded;
+  const after=state().projects[0];
+  const captured=after.cards.find(card=>card.quote===quote);
+  assert.equal(captured.intent,intent);
+  assert.equal(captured.sourceUrl,'https://example.test/cache');
+  assert.match($('cards').textContent,/验证缓存失效条件/);
+  assert.ok($('nodeDetails').textContent.includes(quote));
+  assert.equal((await fetch(appUrl+'/api/captures/'+receipt)).status,404);
+  $('handoffTop').click();
+  assert.equal($('handoffDialog').open,false);
+  const cards=$('cards').querySelectorAll('.card');
+  pointer(w,cards[0],'pointerdown');pointer(w,$('canvas'),'pointerup');
+  pointer(w,cards[2],'pointerdown',{shift:true});pointer(w,$('canvas'),'pointerup');
+  $('connectCards').click();
+  $('handoffTop').click();
+  assert.deepEqual([...$('handoffContent').querySelectorAll('article h3')].map(node=>node.textContent),
+    ['采用缓存方案','验证缓存失效条件']);
+  assert.match($('handoffContent').textContent,/指向 验证缓存失效条件/);
+  const saved=state().projects[0];
+  for (const report of [core.handoffMarkdown(saved,null,true),core.handoffHtml(saved,null,true)]) {
+    assert.ok(report.indexOf('采用缓存方案') < report.indexOf('验证缓存失效条件'));
+    assert.ok(!report.includes('会议室预约'));
+  }
+  $('handoffDialog').close();
+  $('deleteSelected').click();
+  $('confirmDelete').click();
+  assert.deepEqual(state().projects[0].cards.map(card=>card.id),[unrelated.id]);
+  assert.equal(state().projects[0].edges.length,0);
+  $('undo').click();
+  assert.equal(state().projects[0].edges.length,1);
 });

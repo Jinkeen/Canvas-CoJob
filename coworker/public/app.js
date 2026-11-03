@@ -1,4 +1,4 @@
-import {CATEGORIES,WIDTH,HEIGHT,STORAGE_KEY,clone,uid,safeUrl,escapeHtml as e,classify,makeCard,createProject,arrange,initialWorkspace,validateWorkspace,mergeWorkspace,handoffMarkdown,handoffHtml,validateSuggestion} from './core.mjs';
+import {CATEGORIES,WIDTH,HEIGHT,STORAGE_KEY,clone,uid,safeUrl,escapeHtml as e,classify,makeCard,createProject,arrange,initialWorkspace,validateWorkspace,mergeWorkspace,handoffMarkdown,handoffHtml,validateSuggestion,bindHandoffEvidence,keywordFor,handoffSections,linkedTitles} from './core.mjs';
 
 const $=id=>document.getElementById(id);
 const paths={
@@ -49,7 +49,7 @@ try {
   }
 }
 let selected=new Set(),filter='all',query='',view={x:0,y:0,scale:1};
-let undoStack=[],redoStack=[],editingId=null,editingProject=false,handoffIds=null,pendingSuggestion=null,requestId=0,aiController=null;
+let undoStack=[],redoStack=[],editingId=null,editingProject=false,handoffIds=null,handoffLogical=false,pendingSuggestion=null,requestId=0,aiController=null;
 let aiConfig={baseUrl:'',model:'',apiKey:''};
 try {const saved=JSON.parse(localStorage.getItem('canvas-coworker.model.v1')||'{}');aiConfig.baseUrl=typeof saved.baseUrl==='string'?saved.baseUrl:'';aiConfig.model=typeof saved.model==='string'?saved.model:'';}catch{}
 const project=()=>workspace.projects.find(item=>item.id===workspace.activeProjectId)||workspace.projects[0];
@@ -86,6 +86,7 @@ function mutate(change){
   workspace=next;remember(before);persist();render();return true;
 }
 function syncView(){
+  $('nodeDetails').hidden=true;
   $('world').style.transform='translate('+view.x+'px,'+view.y+'px) scale('+view.scale+')';
   $('canvas').style.backgroundSize=20*view.scale+'px '+20*view.scale+'px';
   $('canvas').style.backgroundPosition=view.x+'px '+view.y+'px';
@@ -109,12 +110,12 @@ function renderEdges(){
   const width=Math.max(8000,...all.map(c=>c.x+WIDTH+100)),height=Math.max(8000,...all.map(c=>c.y+HEIGHT+100));
   $('connections').setAttribute('width',String(width));$('connections').setAttribute('height',String(height));
   $('world').style.width=width+'px';$('world').style.height=height+'px';
-  $('connections').innerHTML=project().edges.filter(edge=>ids.has(edge.from)&&ids.has(edge.to)).map(edge=>{
+  $('connections').innerHTML='<defs><marker id="edgeArrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#595b60"/></marker></defs>'+project().edges.filter(edge=>ids.has(edge.from)&&ids.has(edge.to)).map(edge=>{
     const from=project().cards.find(c=>c.id===edge.from),to=project().cards.find(c=>c.id===edge.to);
     let x1=from.x+WIDTH,y1=from.y+HEIGHT/2,x2=to.x,y2=to.y+HEIGHT/2;
     if(from.x>to.x){x1=from.x;x2=to.x+WIDTH;}
     const curve=Math.max(60,Math.abs(x2-x1)*.45),direction=x2>=x1?1:-1;
-    return '<path class="connection-path" d="M'+x1+' '+y1+' C'+(x1+curve*direction)+' '+y1+','+(x2-curve*direction)+' '+y2+','+x2+' '+y2+'"/><circle class="connection-point" cx="'+x1+'" cy="'+y1+'" r="3"/><circle class="connection-point" cx="'+x2+'" cy="'+y2+'" r="3"/>';
+    return '<path class="connection-path" marker-end="url(#edgeArrow)" d="M'+x1+' '+y1+' C'+(x1+curve*direction)+' '+y1+','+(x2-curve*direction)+' '+y2+','+x2+' '+y2+'"/><circle class="connection-point" cx="'+x1+'" cy="'+y1+'" r="3"/><circle class="connection-point" cx="'+x2+'" cy="'+y2+'" r="3"/>';
   }).join('');
 }
 function syncSelection(){
@@ -122,6 +123,8 @@ function syncSelection(){
   $('cards').querySelectorAll('.card').forEach(node=>{node.classList.toggle('selected',selected.has(node.dataset.id));node.setAttribute('aria-pressed',String(selected.has(node.dataset.id)));});
   $('selectionBar').hidden=!selected.size;$('selectedCount').textContent='已选 '+selected.size+' 张';
   $('connectCards').disabled=selected.size!==2;
+  $('connectCards').textContent=selected.size===2?'连线：先选 → 后选':'连接两个节点';
+  showNodeDetails(selected.size===1?[...selected][0]:null);
   $('unlinkCards').disabled=!project().edges.some(edge=>selected.has(edge.from)||selected.has(edge.to));
   $('undo').disabled=!undoStack.length;$('redo').disabled=!redoStack.length;
 }
@@ -135,7 +138,13 @@ function render(){
   $('cardCount').textContent=p.cards.length+' 张摘录';$('connectionCount').textContent=p.edges.length+' 条关联';
   $('cards').innerHTML=cards.map(card=>{
     const cat=CATEGORIES[card.category];
-    return '<article class="card '+(selected.has(card.id)?'selected ':'')+(card.status==='done'?'done':'')+'" data-id="'+e(card.id)+'" style="left:'+card.x+'px;top:'+card.y+'px;--cat-bg:'+cat.background+';--cat-color:'+cat.color+'" tabindex="0" role="button" aria-pressed="'+selected.has(card.id)+'" aria-label="'+e(card.title)+'，双击或按 Enter 编辑"><div class="card-top"><span class="category-tag">'+icon(cat.icon)+cat.label+'</span><span>'+(card.status==='done'?'<span class="status-done">已完成</span>':'')+'<button class="icon-button edit-card" aria-label="编辑 '+e(card.title)+'" title="编辑摘录与用途">'+icon('more')+'</button></span></div><h3 title="'+e(card.title)+'">'+e(card.title)+'</h3><blockquote class="card-quote">'+e(card.quote)+'</blockquote><p class="card-intent"><b>用途</b>'+e(card.intent||'补一句：这段内容可以用来做什么？')+'</p><footer class="card-footer">'+icon('document')+'<span class="source-label" title="'+e(card.source)+'">'+e(card.source)+'</span>'+(card.owner?'<span class="card-owner"><i>'+e(card.owner.slice(0,1))+'</i>'+e(card.owner)+'</span>':'')+'</footer></article>';
+    const keyword = keywordFor(card);
+    return '<article class="card '+(selected.has(card.id)?'selected ':'')+(card.status==='done'?'done':'')+
+      '" data-id="'+e(card.id)+'" style="left:'+card.x+'px;top:'+card.y+'px;--cat-bg:'+cat.background+';--cat-color:'+cat.color+
+      '" tabindex="0" role="button" aria-pressed="'+selected.has(card.id)+'" aria-label="'+e(keyword)+'，双击或按 Enter 编辑">'+
+      '<div class="card-top"><span class="category-tag">'+icon(cat.icon)+cat.label+'</span>'+
+      '<button class="icon-button edit-card" aria-label="编辑 '+e(keyword)+'" title="编辑摘录与用途">'+icon('more')+'</button></div>'+
+      '<h3 title="'+e(keyword)+'">'+e(keyword)+'</h3></article>';
   }).join('');
   let order=0;
   $('groupLabels').innerHTML=Object.entries(CATEGORIES).map(([key,cat])=>{
@@ -145,7 +154,7 @@ function render(){
   }).join('');
   $('emptyState').hidden=!!p.cards.length;$('noResults').hidden=!p.cards.length||!!cards.length;
   $('modelState').classList.toggle('connected',!!aiConfig.baseUrl&&!!aiConfig.model);
-  renderEdges();syncSelection();syncView();
+  renderEdges();syncView();syncSelection();
 }
 function resetFilters(){filter='all';query='';$('search').value='';selected.clear();}
 function newCard(prefill={}){
@@ -174,18 +183,43 @@ function openSettings(){
   $('baseUrl').value=aiConfig.baseUrl;$('modelName').value=aiConfig.model;$('apiKey').value=aiConfig.apiKey;
   error('settingsError','');$('settingsDialog').showModal();
 }
-function openHandoff(ids=null){
+function showNodeDetails(id) {
+  const panel = $('nodeDetails');
+  const node = [...$('cards').children].find(element => element.dataset.id === id);
+  const card = project().cards.find(item => item.id === id);
+  if (!node || !card || node.classList.contains('dragging')) {
+    panel.hidden = true;
+    return;
+  }
+  const rect = node.getBoundingClientRect();
+  panel.innerHTML = '<strong>'+e(keywordFor(card))+'</strong><p><b>用途</b> '+e(card.intent||'尚未填写')+'</p><blockquote>'+e(card.quote)+'</blockquote><small>'+e(card.source)+'</small>';
+  panel.hidden = false;
+  const width = panel.offsetWidth;
+  const left = rect.right + width + 20 < innerWidth ? rect.right + 10 : rect.left - width - 10;
+  panel.style.left = Math.max(8, Math.min(left, innerWidth - width - 8)) + 'px';
+  panel.style.top = Math.max(8, Math.min(rect.top, innerHeight - panel.offsetHeight - 8)) + 'px';
+}
+$('cards').addEventListener('pointerover', event => {
+  const node = event.target.closest('.card');
+  if (node && !node.contains(event.relatedTarget)) showNodeDetails(node.dataset.id);
+});
+$('cards').addEventListener('pointerout', event => {
+  const node = event.target.closest('.card');
+  if (node && !node.contains(event.relatedTarget)) showNodeDetails(selected.size===1?[...selected][0]:null);
+});
+function openHandoff(ids=null,logical=false){
+  handoffLogical=logical;
   handoffIds=ids?.length?[...ids]:null;
-  const p=project(),cards=handoffIds?p.cards.filter(c=>handoffIds.includes(c.id)):p.cards;
-  if(!cards.length){toast('先收集一张卡片，再生成交接简报。');return;}
-  $('handoffScope').textContent=(handoffIds?'选中内容':'整个画布')+' · '+cards.length+' 张摘录';
-  $('handoffContent').innerHTML='<header class="handoff-cover"><small>CANVAS COWORKER / 交接简报</small><h1>'+e(p.name)+'</h1><p>'+e(p.description)+'</p><p>'+cards.length+' 张摘录 · 原话、用途、下一步，一起交接</p></header>'+Object.entries(CATEGORIES).map(([key,cat])=>{
-    const group=cards.filter(c=>c.category===key);if(!group.length)return '';
-    return '<section class="handoff-section"><h2>'+icon(cat.icon)+cat.label+'</h2>'+group.map(card=>{
-      const linked=p.edges.filter(edge=>edge.from===card.id||edge.to===card.id).map(edge=>cards.find(c=>c.id===(edge.from===card.id?edge.to:edge.from))).filter(Boolean);
-      return '<article class="handoff-article"><h3>'+e(card.title)+'</h3><label>用途说明</label><p>'+e(card.intent||'待补充用途说明')+'</p><details open><summary>原始摘录</summary><blockquote>'+e(card.quote)+'</blockquote></details><footer><span>来源：'+e(card.source)+'</span>'+(card.sourceUrl?'<a href="'+e(card.sourceUrl)+'" target="_blank" rel="noopener noreferrer">查看出处 ↗</a>':'')+(card.owner?'<span>对接人：'+e(card.owner)+'</span>':'')+'<span>'+(card.status==='done'?'已完成':'待推进')+'</span></footer>'+(card.nextStep?'<p class="next-step">下一步：'+e(card.nextStep)+'</p>':'')+(linked.length?'<p class="next-step">关联：'+linked.map(c=>e(c.title)).join('、')+'</p>':'')+'</article>';
+  const p=project(),sections=handoffSections(p,handoffIds,logical),cards=sections.flatMap(section=>section.cards);
+  if(!cards.length){toast(logical?'请先用有方向的连线连接至少两个节点。':'先收集一张卡片，再生成交接简报。');return;}
+  $('handoffScope').textContent=(logical?'按连线组织':handoffIds?'选中内容':'整个画布')+' · '+cards.length+' 张摘录';
+  $('handoffContent').innerHTML='<header class="handoff-cover"><small>CANVAS COWORKER / 交接简报</small><h1>'+e(p.name)+'</h1><p>'+e(logical?'':p.description)+'</p><p>'+cards.length+' 张摘录 · 原话、用途、下一步，一起交接</p></header>'+sections.map(({label,cards:group,note})=>{
+    return '<section class="handoff-section"><h2>'+e(label)+'</h2>'+(note?'<p>'+e(note)+'</p>':'')+group.map(card=>{
+      const linked=linkedTitles(p,cards,card.id,logical);
+      return '<article class="handoff-article"><h3>'+e(logical?keywordFor(card):card.title)+'</h3><label>用途说明</label><p>'+e(card.intent||'待补充用途说明')+'</p><footer><span>来源：'+e(card.source)+'</span>'+(card.owner?'<span>对接人：'+e(card.owner)+'</span>':'')+'<span>'+(card.status==='done'?'已完成':'待推进')+'</span></footer>'+(card.nextStep?'<p class="next-step">下一步：'+e(card.nextStep)+'</p>':'')+(linked.length?'<p class="next-step">关联：'+linked.map(e).join('、')+'</p>':'')+'<details data-handoff-evidence><summary>查看原始摘录与出处</summary><blockquote>'+e(card.quote)+'</blockquote>'+(card.sourceUrl?'<a href="'+e(card.sourceUrl)+'" target="_blank" rel="noopener noreferrer">查看出处 ↗</a>':'')+'</details></article>';
     }).join('')+'</section>';
   }).join('');
+  $('handoffDialog').querySelector('[data-evidence=quick]').click();
   $('handoffDialog').showModal();$('handoffDialog').scrollTop=0;
 }
 document.addEventListener('click',event=>{
@@ -205,10 +239,13 @@ $('cardForm').addEventListener('submit',event=>{
   event.preventDefault();const input=formData();
   if(input.sourceUrl&&!safeUrl(input.sourceUrl)){error('cardError','原始链接仅支持 http 或 https。');return;}
   let card;try{card=makeCard(input);}catch(err){error('cardError',err.message);return;}
-  const isEdit=!!editingId,focusId=editingId||card.id;
+  if(saveCard(card,editingId)) $('cardDialog').close();
+});
+function saveCard(card,editId=null){
+  const isEdit=!!editId,focusId=editId||card.id;
   if(mutate((next,p)=>{
-    if(editingId){
-      const old=p.cards.find(c=>c.id===editingId);if(!old)throw new Error('卡片已不存在，请重新打开。');
+    if(editId){
+      const old=p.cards.find(c=>c.id===editId);if(!old)throw new Error('卡片已不存在，请重新打开。');
       Object.assign(old,{...card,id:old.id,x:old.x,y:old.y,createdAt:old.createdAt});
     }else{
       if(next.projects.reduce((n,p)=>n+p.cards.length,0)>=1000)throw new Error('当前工作空间已达到 1000 张卡片上限。');
@@ -218,12 +255,15 @@ $('cardForm').addEventListener('submit',event=>{
       p.cards.push(card);
     }
   })){
-    $('cardDialog').close();resetFilters();selected.add(focusId);render();
+    resetFilters();selected.add(focusId);render();
     const focus=project().cards.find(c=>c.id===focusId),rect=$('canvas').getBoundingClientRect();
     view.scale=Math.max(.75,view.scale);view.x=(rect.width-WIDTH*view.scale)/2-focus.x*view.scale;view.y=Math.max(24,(rect.height-HEIGHT*view.scale)/2)-focus.y*view.scale;syncView();
-    toast(isEdit?'摘录与用途说明已更新。':'灵感已收好，可以继续补充或生成交接简报。');
+    syncSelection();
+    toast(isEdit?'摘录与用途说明已更新。':'已保存为关键词节点。');
+    return true;
   }
-});
+  return false;
+}
 $('projectForm').onsubmit=event=>{
   event.preventDefault();const name=$('projectName').value.trim();if(!name){error('projectError','请给画布取一个名字。');return;}
   if(mutate((next,p)=>{
@@ -277,18 +317,33 @@ $('cardDialog').addEventListener('close',()=>{requestId++;aiController?.abort();
 $('cards').addEventListener('click',event=>{const button=event.target.closest('.edit-card');if(button)editCard(button.closest('.card').dataset.id);});
 $('cards').addEventListener('dblclick',event=>{if(!event.target.closest('button')){const card=event.target.closest('.card');if(card)editCard(card.dataset.id);}});
 $('cards').addEventListener('keydown',event=>{if(event.target.closest('button'))return;const card=event.target.closest('.card');if(card&&event.key==='Enter'){event.preventDefault();editCard(card.dataset.id);}});
-$('deleteCard').onclick=()=>{$('confirmDialog').showModal();};
+let deletionIds = [];
+function confirmDeletion(ids) {
+  if (!ids.length) return;
+  deletionIds = [...ids];
+  $('confirmDialog').querySelector('h2').textContent = '删除 ' + ids.length + ' 个节点？';
+  $('confirmDialog').showModal();
+}
+$('deleteCard').onclick=()=>confirmDeletion(editingId?[editingId]:[]);
+$('deleteSelected').onclick=()=>confirmDeletion([...selected]);
 $('confirmDelete').onclick=()=>{
-  const id=editingId;
-  if(mutate((next,p)=>{p.cards=p.cards.filter(card=>card.id!==id);p.edges=p.edges.filter(edge=>edge.from!==id&&edge.to!==id);})){
-    $('confirmDialog').close();$('cardDialog').close();selected.delete(id);syncSelection();toast('卡片已删除，可以撤销恢复。');
+  const ids = new Set(deletionIds);
+  if (!ids.size) return;
+  if (mutate((next,p)=>{
+    p.cards=p.cards.filter(card=>!ids.has(card.id));
+    p.edges=p.edges.filter(edge=>!ids.has(edge.from)&&!ids.has(edge.to));
+  })) {
+    deletionIds = [];
+    $('confirmDialog').close();
+    if ($('cardDialog').open) $('cardDialog').close();
+    toast('节点已删除，可以撤销恢复。');
   }
 };
 $('search').oninput=()=>{query=$('search').value.trim().toLowerCase();selected.clear();render();fit();};
 $('arrange').onclick=()=>{if(!project().cards.length)return;if(mutate((next,p)=>arrange(p))){fit();toast('已按用途分组排布，内容与分类保持不变。');}};
 $('connectCards').onclick=()=>{
   if(selected.size!==2)return;const [from,to]=selected;
-  if(project().edges.some(edge=>[edge.from,edge.to].includes(from)&&[edge.from,edge.to].includes(to))){toast('这两张卡已经有关联了。');return;}
+  if(project().edges.some(edge=>edge.from===from&&edge.to===to)){toast('这两张卡已经有关联了。');return;}
   if(project().edges.length>=3000){toast('关联数量已达到上限。');return;}
   mutate((next,p)=>p.edges.push({id:uid(),from,to}));toast('已关联两张卡片，交接简报中也会保留关联。');
 };
@@ -298,10 +353,11 @@ function undo(){if(!undoStack.length||externalConflict)return;redoStack.push(JSO
 function redo(){if(!redoStack.length||externalConflict)return;undoStack.push(JSON.stringify(workspace));workspace=JSON.parse(redoStack.pop());selected.clear();persist();render();toast('已重做。');}
 $('undo').onclick=undo;$('redo').onclick=redo;$('fit').onclick=fit;
 $('zoomIn').onclick=()=>zoom(1.15);$('zoomOut').onclick=()=>zoom(1/1.15);
-$('handoffTop').onclick=()=>openHandoff();$('handoffTab').onclick=()=>openHandoff();$('exportSelection').onclick=()=>openHandoff([...selected]);
-$('copyHandoff').onclick=async()=>{try{await navigator.clipboard.writeText(handoffMarkdown(project(),handoffIds));toast('已复制 Markdown，可粘贴到团队文档。');}catch{toast('浏览器未允许复制，请使用「下载 .md」。');}};
-$('downloadMarkdown').onclick=()=>download(project().name+'-交接.md',handoffMarkdown(project(),handoffIds),'text/markdown');
-$('downloadHtml').onclick=()=>download(project().name+'-交接.html',handoffHtml(project(),handoffIds),'text/html');
+bindHandoffEvidence($('handoffDialog'));
+$('handoffTop').onclick=()=>openHandoff(null,true);$('handoffTab').onclick=()=>openHandoff();$('exportSelection').onclick=()=>openHandoff([...selected]);
+$('copyHandoff').onclick=async()=>{try{await navigator.clipboard.writeText(handoffMarkdown(project(),handoffIds,handoffLogical));toast('已复制 Markdown，可粘贴到团队文档。');}catch{toast('浏览器未允许复制，请使用「下载 .md」。');}};
+$('downloadMarkdown').onclick=()=>download(project().name+'-交接.md',handoffMarkdown(project(),handoffIds,handoffLogical),'text/markdown');
+$('downloadHtml').onclick=()=>download(project().name+'-交接.html',handoffHtml(project(),handoffIds,handoffLogical),'text/html');
 $('printHandoff').onclick=()=>window.print();
 function backup(){download('canvas-coworker-'+new Date().toISOString().slice(0,10)+'.json',JSON.stringify(workspace,null,2));toast('备份已下载，包含全部画布、卡片和关联。');}
 $('backup').onclick=backup;$('mobileBackup').onclick=backup;
@@ -338,7 +394,7 @@ $('canvas').addEventListener('pointermove',event=>{
   else{
     const card=project().cards.find(c=>c.id===drag.id);if(!card)return;
     card.x=Math.round(Math.max(24,Math.min(1000000,drag.x+dx/view.scale)));card.y=Math.round(Math.max(72,Math.min(1000000,drag.y+dy/view.scale)));
-    drag.node.style.left=card.x+'px';drag.node.style.top=card.y+'px';drag.node.classList.add('dragging');renderEdges();
+    drag.node.style.left=card.x+'px';drag.node.style.top=card.y+'px';drag.node.classList.add('dragging');$('nodeDetails').hidden=true;renderEdges();
   }
 });
 function finishDrag(event){
@@ -373,7 +429,19 @@ window.addEventListener('storage',event=>{
 const captureBase=location.origin+'/';
 $('captureBookmark').href='javascript:'+encodeURIComponent('(()=>{const payload={quote:String(window.getSelection()).slice(0,16000),source:document.title.slice(0,100),sourceUrl:location.href.slice(0,2000)};window.open('+JSON.stringify(captureBase)+'+"#capture="+encodeURIComponent(JSON.stringify(payload)),"_blank","noopener,noreferrer");})()');
 $('captureBookmark').addEventListener('click',event=>{event.preventDefault();toast('请把这枚按钮拖到独立浏览器的书签栏，再去网页中使用。');});
-function readCapture(){
+async function readCapture(){
+  if (location.hash.startsWith('#receipt=')) {
+    const id=location.hash.slice(9);
+    history.replaceState(null,'',location.pathname);
+    try {
+      if (!/^[0-9a-f-]{36}$/.test(id)) throw new Error();
+      const response=await fetch('/api/captures/'+id);
+      if (!response.ok) throw new Error();
+      const data=await response.json();
+      if (!saveCard(makeCard(data))) newCard(data);
+    } catch { toast('这次摘录未能读取，请返回原网页重试。'); }
+    return;
+  }
   if(!location.hash.startsWith('#capture='))return;
   const hash=location.hash;history.replaceState(null,'',location.pathname);
   try{
