@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Canvas-CoJob 划词收集",
+  "version": "0.1.0",
+  "description": "选中文字后填写用途，保存到本机 Canvas-CoJob。",
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "capture.js"
+      ]
+    }
+  ]
+}

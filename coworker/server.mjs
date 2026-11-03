@@ -1,11 +1,12 @@
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
-import { validateSuggestion } from './public/core.mjs';
+import { validateSuggestion, safeUrl } from './public/core.mjs';
 
 const root = fileURLToPath(new URL('./public/', import.meta.url));
-const routes = {'/':'index.html','/index.html':'index.html','/app.js':'app.js','/core.mjs':'core.mjs','/styles.css':'styles.css','/favicon.svg':'favicon.svg'};
+const routes = {'/':'index.html','/index.html':'index.html','/capture-demo.html':'capture-demo.html','/app.js':'app.js','/core.mjs':'core.mjs','/styles.css':'styles.css','/favicon.svg':'favicon.svg'};
 const mime = {html:'text/html; charset=utf-8',js:'text/javascript; charset=utf-8',mjs:'text/javascript; charset=utf-8',css:'text/css; charset=utf-8',svg:'image/svg+xml'};
 function json(res, status, data) {
   res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
@@ -32,6 +33,7 @@ async function body(req) {
   catch { throw new Error('请求格式错误。'); }
 }
 export function createAppServer() {
+  const captures = new Map();
   return http.createServer(async(req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff');
     res.setHeader('Referrer-Policy','no-referrer');
@@ -40,6 +42,36 @@ export function createAppServer() {
     if(!/^(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/.test(host)) return json(res,403,{error:'仅允许本机访问。'});
     let pathname;
     try { pathname=new URL(req.url,'http://'+host).pathname; } catch { return json(res,400,{error:'地址无效。'}); }
+    if (pathname === '/api/captures' && req.method === 'POST') {
+      if (!/^chrome-extension:\/\/[a-p]{32}$/.test(req.headers.origin || '') ||
+          req.headers['x-coworker-capture'] !== '1' || !req.headers['content-type']?.startsWith('application/json')) {
+        return json(res,403,{error:'仅接受浏览器扩展提交。'});
+      }
+      try {
+        const data = await body(req);
+        if (typeof data?.quote !== 'string' || !data.quote.trim() || data.quote.length > 16000 ||
+            typeof data.intent !== 'string' || !data.intent.trim() || data.intent.length > 4000) {
+          return json(res,400,{error:'请提供有效的原文和用途。'});
+        }
+        for (const [id, item] of captures) if (item.expires < Date.now()) captures.delete(id);
+        if (captures.size >= 100) return json(res,429,{error:'请先打开画布处理已有摘录。'});
+        const id = randomUUID();
+        captures.set(id,{expires:Date.now()+300000, data:{
+          quote:data.quote, intent:data.intent, source:typeof data.source==='string'?data.source.slice(0,100):'网页摘录',
+          sourceUrl:safeUrl(typeof data.sourceUrl==='string'?data.sourceUrl.slice(0,2000):'')
+        }});
+        return json(res,201,{id});
+      } catch {
+        return json(res,400,{error:'摘录内容无效。'});
+      }
+    }
+    if (pathname.startsWith('/api/captures/') && req.method === 'GET') {
+      const id = pathname.slice('/api/captures/'.length);
+      const item = captures.get(id);
+      captures.delete(id);
+      if (!item || item.expires < Date.now()) return json(res,404,{error:'摘录凭证已过期或已使用。'});
+      return json(res,200,item.data);
+    }
     if(pathname==='/api/organize') {
       if(req.method!=='POST') return json(res,405,{error:'请使用 POST 请求。'});
       if(req.headers['x-coworker-request']!=='1' || !req.headers['content-type']?.startsWith('application/json') ||
